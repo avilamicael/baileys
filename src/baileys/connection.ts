@@ -1,0 +1,899 @@
+import type { Boom } from "@hapi/boom";
+import makeWASocket, {
+  type AnyMessageContent,
+  type AuthenticationState,
+  type BaileysEventMap,
+  Browsers,
+  type ChatModification,
+  type ConnectionState,
+  DisconnectReason,
+  isJidGroup,
+  type MessageReceiptType,
+  makeCacheableSignalKeyStore,
+  type ParticipantAction,
+  type proto,
+  type UserFacingSocketConfig,
+  type WAConnectionState,
+  type WAMessage,
+  type WAMessageKey,
+  type WAPresence,
+} from "@whiskeysockets/baileys";
+import { toDataURL } from "qrcode";
+import { downloadMediaFromMessages } from "@/baileys/helpers/downloadMediaFromMessages";
+import { fetchBaileysClientVersion } from "@/baileys/helpers/fetchBaileysClientVersion";
+import { normalizeBrazilPhoneNumber } from "@/baileys/helpers/normalizeBrazilPhoneNumber";
+import { preprocessAudio } from "@/baileys/helpers/preprocessAudio";
+import { shouldIgnoreJid } from "@/baileys/helpers/shouldIgnoreJid";
+import { useRedisAuthState } from "@/baileys/redisAuthState";
+import type {
+  BaileysConnectionOptions,
+  BaileysConnectionWebhookPayload,
+  MessageKeyWithId,
+} from "@/baileys/types";
+import config from "@/config";
+import { asyncSleep } from "@/helpers/asyncSleep";
+import { errorToString } from "@/helpers/errorToString";
+import logger, { baileysLogger, deepSanitizeObject } from "@/lib/logger";
+import redis from "@/lib/redis";
+
+export class BaileysNotConnectedError extends Error {
+  constructor() {
+    super("Phone number not connected");
+  }
+}
+
+export class BaileysConnectionForbiddenError extends Error {
+  constructor() {
+    super("Connection not owned by this API key");
+  }
+}
+
+export class BaileysConnection {
+  private LOGGER_OMIT_KEYS: ReadonlyArray<string> = [
+    "qr",
+    "qrDataUrl",
+    "fileSha256",
+    "jpegThumbnail",
+    "fileEncSha256",
+    "scansSidecar",
+    "midQualityFileSha256",
+    "mediaKey",
+    "senderKeyHash",
+    "recipientKeyHash",
+    "messageSecret",
+    "thumbnailSha256",
+    "thumbnailEncSha256",
+    "appStateSyncKeyShare",
+    "initialHistBootstrapInlinePayload",
+  ];
+  private ALL_BAILEYS_SOCKET_EVENTS: ReadonlyArray<keyof BaileysEventMap> = [
+    "connection.update",
+    "creds.update",
+    "messaging-history.set",
+    "chats.upsert",
+    "chats.update",
+    "lid-mapping.update",
+    "chats.delete",
+    "presence.update",
+    "contacts.upsert",
+    "contacts.update",
+    "messages.delete",
+    "messages.update",
+    "messages.media-update",
+    "messages.upsert",
+    "messages.reaction",
+    "message-receipt.update",
+    "groups.upsert",
+    "groups.update",
+    "group-participants.update",
+    "group.join-request",
+    "blocklist.set",
+    "blocklist.update",
+    "call",
+    "labels.edit",
+    "labels.association",
+    "newsletter.reaction",
+    "newsletter.view",
+    "newsletter-participants.update",
+    "newsletter-settings.update",
+  ];
+
+  private phoneNumber: string;
+  private clientName: string;
+  private webhookUrl: string;
+  private webhookVerifyToken: string;
+  private isReconnect: boolean;
+  private includeMedia: boolean;
+  private syncFullHistory: boolean;
+  private onConnectionClose: (() => void) | null;
+  private socket: ReturnType<typeof makeWASocket> | null;
+  private clearAuthState: AuthenticationState["keys"]["clear"] | null;
+  private clearOnlinePresenceTimeout: ReturnType<typeof setTimeout> | null =
+    null;
+  private reconnectCount = 0;
+  private groupsEnabled: boolean;
+  private _apiKeyHash: string | null;
+  private groupActivityMap: Map<
+    string,
+    { unreadCount: number; lastMessageAt: number }
+  > = new Map();
+  private groupActivityInterval: ReturnType<typeof setInterval> | null = null;
+
+  constructor(phoneNumber: string, options: BaileysConnectionOptions) {
+    this.phoneNumber = phoneNumber;
+    this.clientName = options.clientName || "Chrome";
+    this.webhookUrl = options.webhookUrl;
+    this.webhookVerifyToken = options.webhookVerifyToken;
+    this.onConnectionClose = options.onConnectionClose || null;
+    this.socket = null;
+    this.clearAuthState = null;
+    this.isReconnect = !!options.isReconnect;
+    // TODO(v2): Change default to false.
+    this.includeMedia = options.includeMedia ?? true;
+    this.syncFullHistory = options.syncFullHistory ?? false;
+    this.groupsEnabled = options.groupsEnabled ?? true;
+    this._apiKeyHash = options.apiKeyHash ?? null;
+  }
+
+  get apiKeyHash(): string | null {
+    return this._apiKeyHash;
+  }
+
+  // biome-ignore lint/suspicious/noExplicitAny: Typing this wrapper is not trivial.
+  private withErrorHandling<T extends (...args: any[]) => any>(
+    handlerName: string,
+    handler: T,
+  ): (...args: Parameters<T>) => Promise<void> {
+    return async (...args: Parameters<T>) => {
+      try {
+        await handler.apply(this, args);
+      } catch (error) {
+        logger.error(
+          "[%s] [%s] Error: %s",
+          this.phoneNumber,
+          handlerName,
+          errorToString(error),
+        );
+      }
+    };
+  }
+
+  updateOptions(options: BaileysConnectionOptions) {
+    this.clientName = options.clientName || "Chrome";
+    this.webhookUrl = options.webhookUrl;
+    this.webhookVerifyToken = options.webhookVerifyToken;
+    this.includeMedia = options.includeMedia ?? true;
+    this.syncFullHistory = options.syncFullHistory ?? false;
+
+    const prevGroupsEnabled = this.groupsEnabled;
+    this.groupsEnabled = options.groupsEnabled ?? true;
+    if (prevGroupsEnabled !== this.groupsEnabled && this.socket) {
+      if (this.groupsEnabled) {
+        this.stopGroupActivityFlush();
+      } else {
+        this.startGroupActivityFlush();
+      }
+    }
+
+    this._apiKeyHash = options.apiKeyHash ?? this._apiKeyHash;
+    this.persistMetadata();
+  }
+
+  private persistMetadata() {
+    const key = `@baileys-api:connections:${this.phoneNumber}:authState`;
+    redis.hSet(
+      key,
+      "metadata",
+      JSON.stringify({
+        clientName: this.clientName,
+        webhookUrl: this.webhookUrl,
+        webhookVerifyToken: this.webhookVerifyToken,
+        includeMedia: this.includeMedia,
+        syncFullHistory: this.syncFullHistory,
+        groupsEnabled: this.groupsEnabled,
+        apiKeyHash: this._apiKeyHash,
+      }),
+    );
+  }
+
+  async connect() {
+    if (this.socket) {
+      return;
+    }
+
+    const { state, saveCreds } = await useRedisAuthState(this.phoneNumber, {
+      clientName: this.clientName,
+      webhookUrl: this.webhookUrl,
+      webhookVerifyToken: this.webhookVerifyToken,
+      includeMedia: this.includeMedia,
+      syncFullHistory: this.syncFullHistory,
+      groupsEnabled: this.groupsEnabled,
+      apiKeyHash: this._apiKeyHash,
+    });
+    this.clearAuthState = state.keys.clear;
+
+    const socketOptions: UserFacingSocketConfig = {
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, logger),
+      },
+      markOnlineOnConnect: false,
+      logger: baileysLogger,
+      browser: Browsers.windows(this.clientName),
+      syncFullHistory: this.syncFullHistory,
+      shouldIgnoreJid,
+      version: await fetchBaileysClientVersion().catch((error) => {
+        logger.error(
+          "[%s] [fetchBaileysVersion] Failed to fetch latest WhatsApp Web version, falling back to internal version. %s",
+          this.phoneNumber,
+          errorToString(error),
+        );
+        return undefined;
+      }),
+    };
+
+    try {
+      this.socket = makeWASocket(socketOptions);
+    } catch (error) {
+      logger.error(
+        "[%s] [BaileysConnection.connect] Failed to create socket: %s",
+        this.phoneNumber,
+        errorToString(error),
+      );
+      this.onConnectionClose?.();
+      return;
+    }
+
+    this.addEventListeners({ saveCreds });
+  }
+
+  private addEventListeners({ saveCreds }: { saveCreds: () => Promise<void> }) {
+    type EventHandlers = {
+      [K in keyof BaileysEventMap]?: (
+        data: BaileysEventMap[K],
+      ) => Promise<void>;
+    };
+
+    const handledEvents: EventHandlers = {
+      "creds.update": saveCreds,
+      "connection.update": this.withErrorHandling(
+        "handleConnectionUpdate",
+        this.handleConnectionUpdate,
+      ),
+      "messages.upsert": this.withErrorHandling(
+        "handleMessagesUpsert",
+        this.handleMessagesUpsert,
+      ),
+      "messages.update": this.withErrorHandling(
+        "handleMessagesUpdate",
+        this.handleMessagesUpdate,
+      ),
+      "message-receipt.update": this.withErrorHandling(
+        "handleMessageReceiptUpdate",
+        this.handleMessageReceiptUpdate,
+      ),
+      "messaging-history.set": this.withErrorHandling(
+        "handleMessagingHistorySet",
+        this.handleMessagingHistorySet,
+      ),
+      "groups.update": this.withErrorHandling(
+        "handleGroupsUpdate",
+        this.handleGroupsUpdate,
+      ),
+      "group-participants.update": this.withErrorHandling(
+        "handleGroupParticipantsUpdate",
+        this.handleGroupParticipantsUpdate,
+      ),
+    };
+
+    Object.entries(handledEvents).forEach(([event, handler]) => {
+      this.socket?.ev.on(
+        event as keyof BaileysEventMap,
+        handler as (arg: unknown) => void,
+      );
+    });
+
+    this.ALL_BAILEYS_SOCKET_EVENTS.forEach((event) => {
+      if (event in handledEvents || !config.baileys.listenToEvents.has(event)) {
+        return;
+      }
+
+      this.socket?.ev.on(event, (data) => this.sendToWebhook({ event, data }));
+    });
+  }
+
+  private async close() {
+    this.stopGroupActivityFlush();
+    await this.clearAuthState?.();
+    this.clearAuthState = null;
+    this.socket = null;
+    this.reconnectCount = 0;
+    this.onConnectionClose?.();
+  }
+
+  async logout() {
+    try {
+      await this.safeSocket().logout();
+    } catch (error) {
+      logger.error(
+        "[%s] [LOGOUT] error=%s",
+        this.phoneNumber,
+        errorToString(error),
+      );
+    }
+    await this.close();
+  }
+
+  async sendMessage(
+    jid: string,
+    messageContent: AnyMessageContent,
+    options?: { quoted?: WAMessage },
+  ) {
+    this.safeSocket();
+
+    let waveformProxy: Buffer | null = null;
+    try {
+      if ("audio" in messageContent && Buffer.isBuffer(messageContent.audio)) {
+        const originalAudio = messageContent.audio;
+        // NOTE: Due to limitations in internal Baileys logic used to generate waveform, we use a wav proxy.
+        [messageContent.audio, waveformProxy] = await Promise.all([
+          preprocessAudio(
+            originalAudio,
+            // NOTE: Use lower quality for ptt messages for more realistic quality.
+            messageContent.ptt ? "ogg-low" : "mp3-high",
+          ),
+          messageContent.ptt ? preprocessAudio(originalAudio, "wav") : null,
+        ]);
+        messageContent.mimetype = messageContent.ptt
+          ? "audio/ogg; codecs=opus"
+          : "audio/mpeg";
+      }
+    } catch (error) {
+      // NOTE: This usually means ffmpeg is not installed.
+      logger.error(
+        "[%s] [sendMessage] [ERROR] error=%s",
+        this.phoneNumber,
+        errorToString(error),
+      );
+    }
+
+    return this.safeSocket().sendMessage(jid, messageContent, {
+      waveformProxy,
+      quoted: options?.quoted,
+    });
+  }
+
+  sendPresenceUpdate(type: WAPresence, toJid?: string | undefined) {
+    if (!this.safeSocket().authState.creds.me) {
+      return;
+    }
+
+    return this.safeSocket()
+      .sendPresenceUpdate(type, toJid)
+      .then(() => {
+        if (
+          this.clearOnlinePresenceTimeout &&
+          ["unavailable", "available"].includes(type)
+        ) {
+          clearTimeout(this.clearOnlinePresenceTimeout);
+          this.clearOnlinePresenceTimeout = null;
+        }
+        if (type === "available") {
+          this.clearOnlinePresenceTimeout = setTimeout(() => {
+            this.socket?.sendPresenceUpdate("unavailable", toJid);
+          }, 60000);
+        }
+      });
+  }
+
+  readMessages(keys: proto.IMessageKey[]) {
+    return this.safeSocket().readMessages(keys);
+  }
+
+  chatModify(mod: ChatModification, jid: string) {
+    return this.safeSocket().chatModify(mod, jid);
+  }
+
+  fetchMessageHistory(
+    count: number,
+    oldestMsgKey: proto.IMessageKey,
+    oldestMsgTimestamp: number,
+  ) {
+    return this.safeSocket().fetchMessageHistory(
+      count,
+      oldestMsgKey,
+      oldestMsgTimestamp,
+    );
+  }
+
+  sendReceipts(keys: proto.IMessageKey[], type: MessageReceiptType) {
+    return this.safeSocket().sendReceipts(keys, type);
+  }
+
+  deleteMessage(jid: string, key: MessageKeyWithId) {
+    return this.safeSocket().sendMessage(jid, { delete: key });
+  }
+
+  editMessage(
+    jid: string,
+    key: proto.IMessageKey,
+    messageContent: AnyMessageContent,
+  ) {
+    return this.safeSocket().sendMessage(jid, {
+      ...messageContent,
+      edit: key,
+    } as AnyMessageContent);
+  }
+
+  async profilePictureUrl(jid: string, type?: "preview" | "image") {
+    return this.safeSocket().profilePictureUrl(jid, type);
+  }
+
+  async updateProfilePicture(jid: string, image: Buffer) {
+    return this.safeSocket().updateProfilePicture(jid, image);
+  }
+
+  onWhatsApp(jids: string[]) {
+    return this.safeSocket().onWhatsApp(...jids);
+  }
+
+  getBusinessProfile(jid: string) {
+    return this.safeSocket().getBusinessProfile(jid);
+  }
+
+  groupMetadata(jid: string) {
+    return this.safeSocket().groupMetadata(jid);
+  }
+
+  groupParticipants(
+    jid: string,
+    participants: string[],
+    action: ParticipantAction,
+  ) {
+    return this.safeSocket().groupParticipantsUpdate(jid, participants, action);
+  }
+
+  groupUpdateSubject(jid: string, subject: string) {
+    return this.safeSocket().groupUpdateSubject(jid, subject);
+  }
+
+  groupUpdateDescription(jid: string, description?: string) {
+    return this.safeSocket().groupUpdateDescription(jid, description);
+  }
+
+  groupCreate(subject: string, participants: string[]) {
+    return this.safeSocket().groupCreate(subject, participants);
+  }
+
+  groupLeave(jid: string) {
+    return this.safeSocket().groupLeave(jid);
+  }
+
+  groupRequestParticipantsList(jid: string) {
+    return this.safeSocket().groupRequestParticipantsList(jid);
+  }
+
+  groupRequestParticipantsUpdate(
+    jid: string,
+    participants: string[],
+    action: "approve" | "reject",
+  ) {
+    return this.safeSocket().groupRequestParticipantsUpdate(
+      jid,
+      participants,
+      action,
+    );
+  }
+
+  groupInviteCode(jid: string) {
+    return this.safeSocket().groupInviteCode(jid);
+  }
+
+  groupRevokeInvite(jid: string) {
+    return this.safeSocket().groupRevokeInvite(jid);
+  }
+
+  groupAcceptInvite(code: string) {
+    return this.safeSocket().groupAcceptInvite(code);
+  }
+
+  groupRevokeInviteV4(groupJid: string, invitedJid: string) {
+    return this.safeSocket().groupRevokeInviteV4(groupJid, invitedJid);
+  }
+
+  groupAcceptInviteV4(
+    key: string | WAMessageKey,
+    inviteMessage: proto.Message.IGroupInviteMessage,
+  ) {
+    return this.safeSocket().groupAcceptInviteV4(key, inviteMessage);
+  }
+
+  groupGetInviteInfo(code: string) {
+    return this.safeSocket().groupGetInviteInfo(code);
+  }
+
+  groupToggleEphemeral(jid: string, ephemeralExpiration: number) {
+    return this.safeSocket().groupToggleEphemeral(jid, ephemeralExpiration);
+  }
+
+  groupSettingUpdate(
+    jid: string,
+    setting: "announcement" | "not_announcement" | "locked" | "unlocked",
+  ) {
+    return this.safeSocket().groupSettingUpdate(jid, setting);
+  }
+
+  groupMemberAddMode(jid: string, mode: "admin_add" | "all_member_add") {
+    return this.safeSocket().groupMemberAddMode(jid, mode);
+  }
+
+  groupJoinApprovalMode(jid: string, mode: "on" | "off") {
+    return this.safeSocket().groupJoinApprovalMode(jid, mode);
+  }
+
+  groupFetchAllParticipating() {
+    return this.safeSocket().groupFetchAllParticipating();
+  }
+
+  private safeSocket() {
+    if (!this.socket) {
+      throw new BaileysNotConnectedError();
+    }
+    return this.socket;
+  }
+
+  private async handleConnectionUpdate(data: Partial<ConnectionState>) {
+    const { connection, qr, lastDisconnect, isNewLogin, isOnline } = data;
+
+    // NOTE: Reconnection flow
+    // - `isNewLogin`: sent after close on first connection (see `shouldReconnect` below). We send a `reconnecting` update to indicate qr code has been read.
+    // - `connection === "connecting"` sent on:
+    //   - Server boot, so check for `this.isReconnect`
+    //   - Right after new login, specifically with `qr` code but no value present
+    const isReconnecting =
+      isNewLogin ||
+      (connection === "connecting" &&
+        (("qr" in data && !qr) || this.isReconnect));
+    if (isReconnecting) {
+      logger.debug(
+        "[%s] [handleConnectionUpdate] Reconnecting (isNewLogin=%d, isReconnect=%d, connection=%s, qr=%s)",
+        this.phoneNumber,
+        Number(isNewLogin ?? false),
+        Number(this.isReconnect),
+        connection ?? "",
+        qr ?? "",
+      );
+      this.isReconnect = false;
+      this.handleReconnecting();
+      return;
+    }
+
+    if (connection === "close") {
+      // TODO: Drop @hapi/boom dependency.
+      const error = lastDisconnect?.error as Boom;
+      const statusCode = error?.output?.statusCode;
+      const message = error?.output?.payload?.message || error.message;
+      const shouldReconnect =
+        statusCode !== DisconnectReason.loggedOut &&
+        message !== "QR refs attempts ended";
+
+      if (shouldReconnect) {
+        logger.debug(
+          "[%s] [handleConnectionUpdate] Reconnecting (lastDisconnect=%o)",
+          this.phoneNumber,
+          lastDisconnect ?? {},
+        );
+        await this.handleReconnecting();
+        // NOTE: We don't call `this.close()` here because we want to keep the auth state.
+        this.socket = null;
+        this.connect();
+        return;
+      }
+      await this.close();
+    }
+
+    if (connection === "open" && this.socket?.user?.id) {
+      const phoneNumberFromId = `+${this.socket.user.id.split("@")[0].split(":")[0]}`;
+      if (
+        normalizeBrazilPhoneNumber(phoneNumberFromId) !==
+        normalizeBrazilPhoneNumber(this.phoneNumber)
+      ) {
+        this.handleWrongPhoneNumber();
+        return;
+      }
+    }
+
+    if (qr) {
+      Object.assign(data, {
+        connection: "connecting",
+        qrDataUrl: await toDataURL(qr),
+      });
+    }
+
+    if (isOnline) {
+      Object.assign(data, { connection: "open" });
+    }
+
+    if (data.connection === "open") {
+      this.reconnectCount = 0;
+      this.startGroupActivityFlush();
+    }
+
+    this.sendToWebhook({
+      event: "connection.update",
+      data,
+    });
+  }
+
+  private async handleMessagesUpsert(data: BaileysEventMap["messages.upsert"]) {
+    let messagesData = data;
+
+    if (!this.groupsEnabled) {
+      const individualMessages: typeof data.messages = [];
+
+      for (const msg of data.messages) {
+        const remoteJid = msg.key?.remoteJid;
+        if (remoteJid && isJidGroup(remoteJid)) {
+          const existing = this.groupActivityMap.get(remoteJid);
+          this.groupActivityMap.set(remoteJid, {
+            unreadCount: (existing?.unreadCount ?? 0) + 1,
+            lastMessageAt: Date.now(),
+          });
+        } else {
+          individualMessages.push(msg);
+        }
+      }
+
+      if (individualMessages.length === 0) {
+        return;
+      }
+
+      messagesData = { ...data, messages: individualMessages };
+    }
+
+    const payload: BaileysConnectionWebhookPayload = {
+      event: "messages.upsert",
+      data: messagesData,
+    };
+
+    const media = await downloadMediaFromMessages(messagesData.messages, {
+      includeMedia: this.includeMedia,
+    });
+    if (media) {
+      payload.extra = { media };
+    }
+
+    this.sendToWebhook(payload);
+  }
+
+  private handleMessagesUpdate(data: BaileysEventMap["messages.update"]) {
+    this.sendToWebhook(
+      {
+        event: "messages.update",
+        data,
+      },
+      {
+        awaitResponse: true,
+      },
+    );
+  }
+
+  private handleMessageReceiptUpdate(
+    data: BaileysEventMap["message-receipt.update"],
+  ) {
+    this.sendToWebhook({
+      event: "message-receipt.update",
+      data,
+    });
+  }
+
+  private handleMessagingHistorySet(
+    data: BaileysEventMap["messaging-history.set"],
+  ) {
+    if (!this.syncFullHistory) {
+      return;
+    }
+
+    // NOTE: messaging-history.set event has a payload size is typically extensive so it does not include base64 media content, regardless of the `includeMedia` option.
+    // FIXME: Downloads are failing heavily right now. Under investigation.
+    // await downloadMediaFromMessages(data.messages);
+
+    this.sendToWebhook({ event: "messaging-history.set", data });
+  }
+
+  private handleGroupsUpdate(data: BaileysEventMap["groups.update"]) {
+    this.sendToWebhook({
+      event: "groups.update",
+      data,
+    });
+  }
+
+  private handleGroupParticipantsUpdate(
+    data: BaileysEventMap["group-participants.update"],
+  ) {
+    this.sendToWebhook({
+      event: "group-participants.update",
+      data,
+    });
+  }
+
+  private handleWrongPhoneNumber() {
+    this.sendToWebhook({
+      event: "connection.update",
+      data: { error: "wrong_phone_number" },
+    });
+    this.socket?.ev.removeAllListeners("connection.update");
+    this.logout();
+  }
+
+  private async handleReconnecting() {
+    this.reconnectCount += 1;
+    if (this.reconnectCount > 10) {
+      logger.warn(
+        "[%s] [handleReconnecting] Reconnect count exceeded 10, resetting connection",
+        this.phoneNumber,
+      );
+      await this.close();
+      return;
+    }
+    this.sendToWebhook({
+      event: "connection.update",
+      data: { connection: "reconnecting" as WAConnectionState },
+    });
+  }
+
+  private startGroupActivityFlush() {
+    this.stopGroupActivityFlush();
+    if (this.groupsEnabled) {
+      return;
+    }
+    this.groupActivityInterval = setInterval(() => {
+      this.flushGroupActivity();
+    }, 30_000);
+  }
+
+  private flushGroupActivity() {
+    if (this.groupActivityMap.size === 0) {
+      return;
+    }
+
+    const activities: Array<{
+      jid: string;
+      unreadCount: number;
+      lastMessageAt: number;
+    }> = [];
+
+    for (const [jid, activity] of this.groupActivityMap) {
+      activities.push({ jid, ...activity });
+    }
+    this.groupActivityMap.clear();
+
+    this.sendToWebhook({
+      event: "groups.activity" as keyof BaileysEventMap,
+      data: activities,
+    });
+  }
+
+  private stopGroupActivityFlush() {
+    if (this.groupActivityInterval) {
+      clearInterval(this.groupActivityInterval);
+      this.groupActivityInterval = null;
+    }
+    this.flushGroupActivity();
+  }
+
+  private async sendToWebhook(
+    payload: BaileysConnectionWebhookPayload,
+    options?: {
+      awaitResponse?: boolean;
+    },
+  ) {
+    let sanitizedPayload: Record<string, unknown> | null = null;
+    if (logger.isLevelEnabled("debug")) {
+      sanitizedPayload = deepSanitizeObject(
+        { ...payload },
+        {
+          omitKeys: [...this.LOGGER_OMIT_KEYS],
+        },
+      );
+      logger.debug(
+        "[%s] [sendToWebhook] (options: %o) payload=%o",
+        this.phoneNumber,
+        options || {},
+        sanitizedPayload,
+      );
+    }
+
+    // Snapshot webhook destination to prevent updateOptions() from changing
+    // the target mid-retry.
+    const webhookUrl = this.webhookUrl;
+
+    const serializedBody = JSON.stringify({
+      ...payload,
+      webhookVerifyToken: this.webhookVerifyToken,
+      awaitResponse: options?.awaitResponse,
+    });
+
+    const { maxRetries, retryInterval, backoffFactor } =
+      config.webhook.retryPolicy;
+    let attempt = 0;
+    let delay = retryInterval;
+
+    while (attempt <= maxRetries) {
+      const { response, error } = await this.sendPayloadToWebhook(
+        webhookUrl,
+        serializedBody,
+      );
+      if (response) {
+        if (response.ok) {
+          if (logger.isLevelEnabled("debug")) {
+            logger.debug(
+              "[%s] [sendToWebhook] [SUCCESS] event=%s status=%d",
+              this.phoneNumber,
+              payload.event,
+              response.status,
+            );
+          }
+          return response;
+        }
+        logger.error(
+          "[%s] [sendToWebhook] [ERROR] webhookUrl=%s payload=%o response=%o",
+          this.phoneNumber,
+          webhookUrl,
+          sanitizedPayload ?? payload.event,
+          { status: response.status, statusText: response.statusText },
+        );
+      }
+
+      if (error) {
+        logger.error(
+          "[%s] [sendToWebhook] [ERROR] webhookUrl=%s payload=%o error=%s",
+          this.phoneNumber,
+          webhookUrl,
+          sanitizedPayload ?? payload.event,
+          errorToString(error),
+        );
+      }
+
+      attempt++;
+      if (attempt <= maxRetries) {
+        logger.info(
+          "[%s] [sendToWebhook] [RETRYING] payload=%o attempt=%d/%d delay=%dms",
+          this.phoneNumber,
+          sanitizedPayload ?? payload.event,
+          attempt,
+          maxRetries,
+          delay,
+        );
+        const jitter = Math.floor(Math.random() * 1000);
+        await asyncSleep(delay + jitter);
+        delay *= backoffFactor;
+      }
+    }
+
+    logger.error(
+      "[%s] [sendToWebhook] [FAILED] webhookUrl=%s payload=%o",
+      this.phoneNumber,
+      webhookUrl,
+      sanitizedPayload ?? payload.event,
+    );
+  }
+
+  private async sendPayloadToWebhook(
+    webhookUrl: string,
+    serializedBody: string,
+  ): Promise<{ response?: Response; error?: Error }> {
+    try {
+      const response = await fetch(webhookUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: serializedBody,
+      });
+      return { response };
+    } catch (error) {
+      return { error: error as Error };
+    }
+  }
+}
