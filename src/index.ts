@@ -3,7 +3,8 @@ import baileys from "@/baileys";
 import config from "@/config";
 import { errorToString } from "@/helpers/errorToString";
 import logger, { deepSanitizeObject } from "@/lib/logger";
-import { initializeRedis } from "@/lib/redis";
+import redis, { initializeRedis } from "@/lib/redis";
+import { REDIS_KEY_PREFIX } from "@/middlewares/auth";
 import { MediaCleanupService } from "@/services/mediaCleanup";
 
 process.on("uncaughtException", (error) => {
@@ -43,14 +44,24 @@ app.listen(config.port, () => {
     mediaCleanup.start();
   }
 
-  initializeRedis().then(() =>
-    baileys.reconnectFromAuthStore().catch((error) => {
+  initializeRedis().then(async () => {
+    const apiKey = process.env.API_KEY;
+    if (apiKey) {
+      const redisKey = `${REDIS_KEY_PREFIX}:${apiKey}`;
+      const existing = await redis.get(redisKey);
+      if (!existing) {
+        await redis.set(redisKey, JSON.stringify({ role: "admin" }));
+        logger.info("Auto-seeded API_KEY into Redis");
+      }
+    }
+
+    return baileys.reconnectFromAuthStore().catch((error) => {
       logger.error(
         "Failed to reconnect from auth store: %s",
         errorToString(error),
       );
-    }),
-  );
+    });
+  });
 });
 
 const shutdown = (signal: string) => {
