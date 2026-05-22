@@ -25,6 +25,12 @@ function extractQuoted(content: {
   };
 }
 
+// Base64 string -> Buffer (kept in memory) | { url } -> passed through so
+// Baileys streams the file directly from the URL (low memory for large files).
+function toMedia(value: string | { url: string }): Buffer | { url: string } {
+  return typeof value === "string" ? Buffer.from(value, "base64") : value;
+}
+
 export function buildMessageContent(
   content: Static<typeof anyMessageContent>,
 ): BuildMessageContentResult {
@@ -40,7 +46,7 @@ export function buildMessageContent(
     return {
       messageContent: {
         ...rest,
-        image: Buffer.from(content.image, "base64"),
+        image: toMedia(content.image),
       },
       quoted: extractQuoted(content),
     };
@@ -50,7 +56,7 @@ export function buildMessageContent(
     return {
       messageContent: {
         ...rest,
-        video: Buffer.from(content.video, "base64"),
+        video: toMedia(content.video),
       },
       quoted: extractQuoted(content),
     };
@@ -60,7 +66,7 @@ export function buildMessageContent(
     return {
       messageContent: {
         ...rest,
-        document: Buffer.from(content.document, "base64"),
+        document: toMedia(content.document),
       },
       quoted: extractQuoted(content),
     };

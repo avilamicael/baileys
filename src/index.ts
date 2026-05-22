@@ -27,7 +27,12 @@ const mediaCleanup = new MediaCleanupService({
   intervalMs: config.media.cleanupIntervalMs,
 });
 
-app.listen(config.port, () => {
+// Large media is streamed from a URL (tiny request body); this limit only
+// guards the base64 fallback path. Override with MAX_REQUEST_BODY_SIZE_MB.
+const maxRequestBodySize =
+  Number(process.env.MAX_REQUEST_BODY_SIZE_MB ?? 64) * 1024 * 1024;
+
+app.listen({ port: config.port, maxRequestBodySize }, () => {
   logger.info(
     `${config.packageInfo.name}@${config.packageInfo.version} running on ${app.server?.hostname}:${app.server?.port}`,
   );

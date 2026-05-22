@@ -57,6 +57,22 @@ export const quotedMessage = t.Object(
   },
 );
 
+// Media may be sent either as a base64-encoded string (small files) or as a
+// `{ url }` object (large files) — in the latter case Baileys streams the file
+// directly from the URL, avoiding loading it fully into memory.
+const mediaInput = (label: string) =>
+  t.Union([
+    t.String({ description: `Base64 encoded ${label} data` }),
+    t.Object(
+      {
+        url: t.String({
+          description: `URL Baileys fetches the ${label} from (streamed, not buffered)`,
+        }),
+      },
+      { title: `${label} from URL` },
+    ),
+  ]);
+
 export const anyMessageContent = t.Union([
   t.Object(
     {
@@ -72,7 +88,7 @@ export const anyMessageContent = t.Union([
   ),
   t.Object(
     {
-      image: t.String({ description: "Base64 encoded image data" }),
+      image: mediaInput("image"),
       caption: t.Optional(t.String()),
       mimetype: t.Optional(t.String()),
       quotedMessage: t.Optional(quotedMessage),
@@ -83,7 +99,7 @@ export const anyMessageContent = t.Union([
   ),
   t.Object(
     {
-      video: t.String({ description: "Base64 encoded video data" }),
+      video: mediaInput("video"),
       caption: t.Optional(t.String()),
       mimetype: t.Optional(t.String()),
       quotedMessage: t.Optional(quotedMessage),
@@ -94,7 +110,7 @@ export const anyMessageContent = t.Union([
   ),
   t.Object(
     {
-      document: t.String({ description: "Base64 encoded document data" }),
+      document: mediaInput("document"),
       fileName: t.Optional(t.String()),
       mimetype: t.Optional(t.String()),
       caption: t.Optional(t.String()),
